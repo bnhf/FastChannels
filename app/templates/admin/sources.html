@@ -3396,6 +3396,26 @@
     function renderPhiloConfig(sourceId, schema, values) {
       const signedIn = !!(values.session_cookies);
       const email = String(values.email || '');
+      const toggleHtml = (key) => {
+        const field = schema.find(f => f.key === key);
+        if (!field) return '';
+        const checked = ['1', 'true', 'yes', 'on'].includes(
+          String(values[key] ?? field.default ?? '').trim().toLowerCase()
+        );
+        return `
+          <div class="field field-full">
+            <div class="config-toggle-field">
+              <div class="config-toggle-text">
+                <label for="cfg-${sourceId}-${key}">${escapeHtml(field.label)}</label>
+                <div class="help">${escapeHtml(field.help_text || '')}</div>
+              </div>
+              <label class="toggle" title="${escapeHtml(field.label)}">
+                <input type="checkbox" id="cfg-${sourceId}-${key}" data-key="${key}" data-secret="false"${checked ? ' checked' : ''}>
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>`;
+      };
       return `
         <div class="config-title">Philo Settings</div>
         <div class="config-note">
@@ -3426,6 +3446,16 @@
             <button class="btn btn-cancel btn-sm" type="button"
                     onclick="philoSendCode(${sourceId})">Resend</button>
           </div>
+        </div>
+
+        <div class="fields-grid">
+          ${toggleHtml('exclude_fast_channels')}
+          ${toggleHtml('include_out_of_plan')}
+        </div>
+
+        <div class="config-actions">
+          <span class="config-status" id="config-status-${sourceId}"></span>
+          <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
         </div>`;
     }
 

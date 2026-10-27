@@ -642,6 +642,12 @@ def save_source_config(source_id):
         _toggle_enabled(old, key) != _toggle_enabled(current, key)
         for key in ('exclude_fast_channels', 'use_provider_numbers')
     )
+    # Philo's FAST-exclusion and out-of-plan toggles both change which channels
+    # the guide scrape keeps.
+    philo_lineup_changed = source.name == 'philo' and any(
+        _toggle_enabled(old, key) != _toggle_enabled(current, key)
+        for key in ('exclude_fast_channels', 'include_out_of_plan')
+    )
     if creds_changed or sling_subscription_changed:
         for tk in _AUTH_STATE:
             if data.get(tk) in (None, '', '••••••••'):  # skip values set in this save
@@ -731,6 +737,9 @@ def save_source_config(source_id):
     elif source.name == 'directv' and directv_lineup_changed and source.is_enabled:
         # Same rationale as Sling above — the FAST-exclusion and numbering
         # toggles change which channels come back from fetch_channels().
+        trigger_scrape(source.name, force_full=True)
+        full_scrape_queued = True
+    elif source.name == 'philo' and philo_lineup_changed and source.is_enabled:
         trigger_scrape(source.name, force_full=True)
         full_scrape_queued = True
     elif source.name == 'pbs' and old != current and source.is_enabled:

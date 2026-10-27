@@ -87,6 +87,11 @@ _GUIDE_VARS = {
 _SESSION_TTL = 300 * 24 * 60 * 60   # ~10 months
 _DASH_TTL = 6 * 60 * 60        # keep one playback session stable during long captures
 _GUIDE_MAX_PAGES = 12
+# Public (no sign-in) lineup page. It embeds a "channelGroups" JSON array whose
+# groups are typed core / fast / addons / callout, each listing channel ids in
+# the same base64 "Channel:<n>" form the guide returns as channelId. The "fast"
+# group is the only upstream marker for Philo's free, ad-supported channels.
+_LINEUP_URL = f"{_ORIGIN}/go/channels"
 # Airings per channel to pull for the guide. 48 half-hour slots ≈ 24–34h of EPG;
 # the grid supports more (hasNextPage) but this is a sensible per-scrape window.
 _GUIDE_EPG_TILES = 48
@@ -135,7 +140,12 @@ class PhiloScraper(BaseScraper):
                     help_text="Off by default: only scrape channels Philo exposes "
                               "for the signed-in account. Turn on to include the "
                               "full guide catalog, including unsubscribed channels."),
+        ConfigField("exclude_fast_channels", "Exclude FAST channels",
+                    field_type="toggle", default=False,
+                    help_text="On = leave out Philo's free, ad-supported channels "
+                              "(the \"Additional free channels\" in Philo's lineup)."),
     ]
+    FAST_TAG = "Philo FAST"
     # When an account expires or loses a package, the guide may intentionally
     # shrink from the full catalog to only free/entitled rows. Let the normal
     # missed-scrape path age those rows out instead of treating it as a parser
@@ -163,10 +173,67 @@ class PhiloScraper(BaseScraper):
     def _guide_vars(self) -> dict:
         variables = dict(_GUIDE_VARS)
         capabilities = list(_GUIDE_VARS.get("capabilities") or [])
-        if not bool(self.config.get("include_out_of_plan", False)):
+        if not self._toggle_on("include_out_of_plan"):
             capabilities = [c for c in capabilities if c != "OUT_OF_PLAN_CONTENT"]
         variables["capabilities"] = capabilities
         return variables
+
+    def _toggle_on(self, key: str) -> bool:
+        # The admin UI saves toggles as the strings 'true'/'false', so bool()
+        # alone would read a saved 'false' as on.
+        return str(self.config.get(key, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+    # ── FAST channel identification (public lineup page) ────────────────────
+
+    @staticmethod
+    def _parse_lineup_fast_ids(html: str) -> set[str]:
+        """Channel ids in the lineup's "fast" group, minus any also listed in
+        "core" (QVC/HSN appear in both; the paid lineup wins)."""
+        marker = '"channelGroups":'
+        i = html.find(marker)
+        if i < 0:
+            return set()
+        groups, _ = json.JSONDecoder().raw_decode(html, i + len(marker))
+        fast: set[str] = set()
+        core: set[str] = set()
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            ids = {c["id"] for c in (group.get("channels") or [])
+                   if isinstance(c, dict) and c.get("id")}
+            if group.get("type") == "fast":
+                fast |= ids
+            elif group.get("type") == "core":
+                core |= ids
+        return fast - core
+
+    def _fast_channel_ids(self, *, required: bool) -> set[str]:
+        """Philo's FAST channel ids, refreshed from the public lineup page and
+        cached in config so a failed fetch doesn't let FAST channels back in.
+        With nothing cached, raises ScrapeSkipError when `required` (the
+        exclusion is on) rather than scraping an unfiltered lineup."""
+        import requests as _r
+        ids: set[str] = set()
+        try:
+            # Deliberately cookie-less: a signed-in session may be redirected
+            # from the marketing page into the player.
+            r = _r.get(_LINEUP_URL, headers={"User-Agent": _UA, "Accept": "text/html"}, timeout=20)
+            r.raise_for_status()
+            ids = self._parse_lineup_fast_ids(r.text)
+        except Exception as e:
+            logger.warning("[philo] could not read the FAST lineup from %s: %s", _LINEUP_URL, e)
+        if ids:
+            if sorted(ids) != sorted(self.config.get("fast_channel_ids") or []):
+                self._update_config("fast_channel_ids", sorted(ids))
+            return ids
+        cached = set(self.config.get("fast_channel_ids") or [])
+        if cached:
+            logger.warning("[philo] using %d cached FAST channel ids", len(cached))
+            return cached
+        if required:
+            raise ScrapeSkipError("[philo] FAST lineup unavailable and none cached; "
+                                  "keeping previous channel data")
+        return set()
 
     # ── Session / auth ──────────────────────────────────────────────────────
 
@@ -416,6 +483,9 @@ class PhiloScraper(BaseScraper):
         if not self._ensure_session():
             raise ScrapeSkipError("[philo] no session; keeping previous channel data")
 
+        exclude_fast = self._toggle_on("exclude_fast_channels")
+        fast_ids = self._fast_channel_ids(required=exclude_fast)
+        self.excluded_channel_ids = set()
         channels: list[ChannelData] = []
         seen: set[str] = set()
         cursor = None
@@ -431,7 +501,11 @@ class PhiloScraper(BaseScraper):
                 if not cid or cid in seen:
                     continue
                 seen.add(cid)
-                self._add_channel(channels, cid, ch)
+                is_fast = cid in fast_ids
+                if exclude_fast and is_fast:
+                    self.excluded_channel_ids.add(cid)
+                    continue
+                self._add_channel(channels, cid, ch, is_fast=is_fast)
             page_info = groups.get("pageInfo") or {}
             if not page_info.get("hasNextPage"):
                 break
@@ -441,10 +515,14 @@ class PhiloScraper(BaseScraper):
             raise ScrapeSkipError("[philo] guide returned 0 channels; keeping previous data")
 
         self._persist_session()
-        logger.info("[philo] %d channels fetched", len(channels))
+        if self.excluded_channel_ids:
+            logger.info("[philo] %d channels fetched (%d FAST channels excluded)",
+                        len(channels), len(self.excluded_channel_ids))
+        else:
+            logger.info("[philo] %d channels fetched", len(channels))
         return channels
 
-    def _add_channel(self, channels: list[ChannelData], cid: str, ch: dict) -> None:
+    def _add_channel(self, channels: list[ChannelData], cid: str, ch: dict, *, is_fast: bool = False) -> None:
         name = ch.get("displayName") or "Unknown"
         logo = None
         white = ch.get("whiteLogo") or {}
@@ -464,6 +542,7 @@ class PhiloScraper(BaseScraper):
             category=category,
             country="US",
             stream_type="dash",   # DRM bridge — DASH+Widevine, browser/EME only
+            tags=[self.FAST_TAG] if is_fast else [],
         ))
 
     # ── fetch_epg (forward schedule from the guide grid) ────────────────────
